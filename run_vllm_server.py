@@ -75,6 +75,27 @@ def section(title):
     print(f"── {title} ──")
 
 
+# 대화형 여부는 한 곳에서만 판단한다. --yes 를 주거나 stdin 이 TTY 가 아니면 묻지 않는다.
+# (스크립트·nohup·다른 프로젝트에서 부를 때 프롬프트에서 멈추면 안 된다)
+_INTERACTIVE = True
+
+
+def interactive():
+    return _INTERACTIVE and sys.stdin.isatty()
+
+
+def confirm(msg, default_yes, auto_reason=""):
+    """예/아니오 확인. 비대화형이면 default_yes 를 그대로 쓴다."""
+    if not interactive():
+        print(f"{msg} → {'예' if default_yes else '아니오'} (자동{auto_reason})")
+        return default_yes
+    suffix = "(Y/n)" if default_yes else "(y/N)"
+    a = (dm.prompt(f"{msg} {suffix}: ") or "").strip().lower()
+    if not a:
+        return default_yes
+    return a.startswith("y")
+
+
 def die(*lines, code=1):
     """stdout 을 비운 뒤 stderr 로 알리고 끝낸다.
 
@@ -98,7 +119,8 @@ def parse_args(argv):
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("model", nargs="?", default=None,
                    help="모델 디렉터리 또는 HF 리포. 생략하면 models/ 에서 고른다")
-    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--port", type=int, default=None,
+                   help="지정하면 묻지 않는다. 생략하면 비어 있는 포트를 기본값으로 제안")
     p.add_argument("--host", default="127.0.0.1",
                    help="기본 127.0.0.1 — 외부 노출은 리버스 프록시로")
     p.add_argument("--util", type=float, default=None,
@@ -106,6 +128,12 @@ def parse_args(argv):
     p.add_argument("--len", dest="max_model_len", type=int, default=None,
                    help="--max-model-len. 생략하면 모델 기본값")
     p.add_argument("--max-num-seqs", type=int, default=None)
+    p.add_argument("--kv", dest="kv_cache_dtype", default="fp8",
+                   choices=["fp8", "fp8_e4m3", "fp8_e5m2", "auto"],
+                   help="KV 캐시 양자화. 기본 fp8 — 토큰 밀도 1.97배를 품질 손실 "
+                        "없이 얻는다(실측: 64k 문맥까지 PPL 0.987~0.999x, "
+                        "정답과제 동일). auto 는 fp16 원본. "
+                        "docs/quantization_concepts.md §7.95.3")
     p.add_argument("--eager", dest="eager", action="store_true", default=True,
                    help="--enforce-eager (기본 켜짐). CUDA 그래프 캡처를 건너뛰어 기동이 빠르다")
     p.add_argument("--no-eager", dest="eager", action="store_false",
@@ -124,8 +152,15 @@ def parse_args(argv):
                    help="준비 대기 상한(초, 기본 180). 넘겨도 서버는 계속 로딩한다")
     p.add_argument("--dry-run", action="store_true",
                    help="실행할 명령만 출력하고 끝낸다")
+    p.add_argument("--kill-existing", dest="kill_existing", action="store_true", default=None,
+                   help="기존 vLLM 을 묻지 않고 종료한다")
+    p.add_argument("--keep-existing", dest="kill_existing", action="store_false",
+                   help="기존 vLLM 을 묻지 않고 그대로 둔다 (다중 인스턴스)")
     p.add_argument("--force", action="store_true",
-                   help="포트를 쓰는 기존 프로세스를 묻지 않고 종료한다")
+                   help="--kill-existing 의 별칭 (하위 호환)")
+    p.add_argument("-y", "--yes", action="store_true",
+                   help="모든 확인을 자동 승인하고 아무것도 묻지 않는다. "
+                        "다른 프로젝트에서 벤치마크용으로 부를 때 쓴다")
     p.add_argument("--extra", nargs=argparse.REMAINDER, default=[],
                    help="이후 인자를 vllm serve 에 그대로 넘긴다. "
                         "⚠ REMAINDER 라 **뒤에 오는 것을 전부 삼킨다** — 반드시 맨 끝에 둘 것. "
@@ -225,6 +260,9 @@ def choose_model():
     section("모델 선택")
     for i, (d, size) in enumerate(models, 1):
         print(f"  [{i}] {os.path.basename(d):<48} {dm._fmt_bytes(size)}")
+    if not interactive():
+        print(f"  (묻지 않음 — [1] 선택). 지정하려면 인자로 모델 경로를 주십시오.")
+        return models[0][0]
     while True:
         a = dm.prompt("번호 선택 [기본값 1]: ") or "1"
         if a.isdigit() and 1 <= int(a) <= len(models):
@@ -287,7 +325,8 @@ def inspect_model(path, gpu):
             print("  ⛔ 이 양자화는 이 GPU 에서 동작하지 않습니다. 기동해도 실패합니다.",
                   file=sys.stderr)
             sys.stderr.flush()
-            if not (dm.prompt("     그래도 계속할까요? (y/N): ") or "N").lower().startswith("y"):
+            if not confirm("     그래도 계속할까요?", default_yes=False,
+                           auto_reason=" — 중단합니다"):
                 sys.exit(1)
     else:
         dt = config.get("torch_dtype") or config.get("dtype") or "?"
@@ -357,8 +396,8 @@ def ask_util(auto, ceiling, label_mib, weight_b):
 
     비대화형(스크립트·nohup)이면 묻지 않고 자동값을 쓴다.
     """
-    if not sys.stdin.isatty():
-        print(f"  (비대화형 — 자동값 {auto:.2f} 사용)")
+    if not interactive():
+        print(f"  (묻지 않음 — 자동값 {auto:.2f} 사용)")
         return auto
 
     w_mib = weight_b / (1024 * 1024) if weight_b else 0
@@ -420,7 +459,8 @@ def _check_budget(util, label_mib, weight_b):
         print("     GPU를 쓰는 다른 프로세스를 내리거나 --util 을 직접 지정하십시오.",
               file=sys.stderr)
         sys.stderr.flush()
-        if not (dm.prompt("     그래도 진행할까요? (y/N): ") or "N").lower().startswith("y"):
+        if not confirm("     그래도 진행할까요?", default_yes=False,
+                       auto_reason=" — 중단합니다"):
             sys.exit(1)
     elif head_mib < 2048:
         print("  ⚠ KV 여유가 2 GiB 미만입니다. 컨텍스트를 짧게 잡으십시오.")
@@ -576,38 +616,162 @@ def decide_tool_parser(path, config, override, disabled):
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. 기동
 # ─────────────────────────────────────────────────────────────────────────────
+def running_vllm():
+    """지금 떠 있거나 **기동 중인** vLLM 을 모두 찾는다.
+
+    ★ 포트만 봐서는 못 잡는다. vLLM 은 파이썬 임포트 → 가중치 적재 → KV 생성 을
+    다 마친 **1~2분 뒤에야 포트를 연다.** 그 사이에 두 번째를 띄우면 포트가 비어
+    있으니 충돌이 감지되지 않고, 둘 다 진행하다가 뒤엣놈이 이렇게 죽는다:
+
+      ValueError: Free memory on device cuda:0 (44.86/63.39 GiB) on startup is
+      less than desired GPU memory utilization (0.94, 59.59 GiB)
+
+    실제로 그 사고가 났다. 그래서 포트가 아니라 **프로세스**를 본다.
+    """
+    out = []
+    try:
+        r = subprocess.run(["pgrep", "-af", "bin/vllm serve"],
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        return out
+    me = str(os.getpid())
+    for line in r.stdout.splitlines():
+        pid, _, cmd = line.partition(" ")
+        if pid == me or "pgrep" in cmd:
+            continue
+        port = model = None
+        toks = cmd.split()
+        for i, t in enumerate(toks):
+            if t == "--port" and i + 1 < len(toks):
+                port = toks[i + 1]
+            elif t == "--served-model-name" and i + 1 < len(toks):
+                model = toks[i + 1]
+        if model is None:
+            for t in toks:
+                if "/models/" in t:
+                    model = os.path.basename(t.rstrip("/"))
+                    break
+        out.append((pid, model or "?", port or "?"))
+    return out
+
+
+def gpu_mib_of(pid):
+    """이 vLLM 인스턴스가 잡은 VRAM.
+
+    ★ pid 를 그대로 nvidia-smi 와 대조하면 안 된다. `vllm serve` 의 최상위 프로세스는
+    APIServer 이고, **GPU 를 실제로 잡는 것은 그 자식인 EngineCore** 다.
+    (실측: APIServer 2023436 → 자식 EngineCore 2025442 가 60,272 MiB 보유)
+    그래서 자손까지 훑어 합산한다.
+    """
+    try:
+        kids = subprocess.run(["pgrep", "-P", str(pid)],
+                              capture_output=True, text=True, timeout=10).stdout.split()
+    except Exception:
+        kids = []
+    family = {str(pid), *kids}
+    for k in list(kids):                       # 손자까지 (EngineCore 가 더 낳는 경우)
+        try:
+            family.update(subprocess.run(["pgrep", "-P", k], capture_output=True,
+                                         text=True, timeout=10).stdout.split())
+        except Exception:
+            pass
+    total = 0
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,used_memory",
+                            "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=10)
+        for line in r.stdout.splitlines():
+            a, _, b = line.partition(",")
+            if a.strip() in family:
+                total += int(b.strip())
+    except Exception:
+        return None
+    return total or None
+
+
+def handle_existing(kill_existing):
+    """기존 vLLM 을 어떻게 할지 정한다. (종료했나 bool)
+
+    **여러 인스턴스를 띄우는 것 자체는 정상 사용이다** — 다른 모델을 동시에 쓰거나
+    A/B 비교를 할 때 그렇게 한다. (vLLM 한 프로세스는 모델 하나만 서빙한다.
+    `--served-model-name` 은 별칭일 뿐이고, `--lora-modules` 는 같은 베이스의
+    어댑터만 가능하다.) 그래서 죽이지 않고 **포트를 바꿔 공존**하는 길을 연다.
+    """
+    procs = running_vllm()
+    if not procs:
+        return False
+    section("기존 vLLM")
+    for pid, model, port in procs:
+        mib = gpu_mib_of(pid)
+        print(f"  pid {pid:<8} {model:<46} :{port}"
+              + (f"  {mib} MiB" if mib else "  (기동 중 — GPU 미점유)"))
+    if kill_existing is None:
+        kill_existing = confirm("  이 vLLM 을 종료할까요?", default_yes=False,
+                                auto_reason=" — 그대로 두고 다른 포트를 씁니다")
+    if not kill_existing:
+        print("  그대로 둡니다. 포트가 겹치지 않게 고르십시오.")
+        return False
+    # 프로세스 그룹째 보낸다. APIServer 만 죽이면 GPU 를 쥔 자식 EngineCore 가
+    # 살아남아 VRAM 이 안 풀리는 일이 생긴다 (run_vllm_server 는 start_new_session
+    # 으로 띄우므로 pid 가 곧 그룹 리더다).
+    def _sig(pid, sig):
+        for target in (lambda: os.killpg(int(pid), sig), lambda: os.kill(int(pid), sig)):
+            try:
+                target(); return
+            except OSError:
+                continue
+
+    for pid, _, _ in procs:
+        _sig(pid, signal.SIGTERM)
+    for _ in range(40):
+        if not running_vllm():
+            break
+        time.sleep(0.5)
+    for pid, _, _ in running_vllm():
+        _sig(pid, signal.SIGKILL)
+    time.sleep(1)
+    print("  종료했습니다.")
+    wait_vram_release()
+    return True
+
+
+def pick_port(want, host):
+    """포트를 정한다. --port 를 주면 묻지 않는다.
+
+    기존 vLLM 이 있든 없든 **항상** 물어본다 — 다중 인스턴스가 정상 사용이므로
+    사용자가 매번 의식적으로 고르는 편이 안전하다.
+    """
+    if want is not None:
+        if port_in_use(host, want):
+            print(f"  ⚠ 포트 {want} 가 이미 사용 중입니다 (지정값이라 그대로 진행)")
+        return want
+    base = 8000
+    while port_in_use(host, base) and base < 8100:
+        base += 1
+    if not interactive():
+        print(f"  포트 {base} (자동 — 비어 있는 첫 포트)")
+        return base
+    used = [p for p in (8000, 8001, 8002, 8003) if port_in_use(host, p)]
+    if used:
+        print(f"  사용 중: {', '.join(str(x) for x in used)}")
+    while True:
+        a = (dm.prompt(f"  포트 [기본값 {base}]: ") or str(base)).strip()
+        if not a.isdigit():
+            print("    숫자를 넣으십시오."); continue
+        v = int(a)
+        if not (1 <= v <= 65535):
+            print("    1~65535 범위여야 합니다."); continue
+        if port_in_use(host, v):
+            if not confirm(f"    포트 {v} 는 이미 사용 중입니다. 그래도 쓸까요?",
+                           default_yes=False):
+                continue
+        return v
+
+
 def port_in_use(host, port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(1.0)
         return s.connect_ex((host if host != "0.0.0.0" else "127.0.0.1", port)) == 0
-
-
-def free_port(host, port, force):
-    if not port_in_use(host, port):
-        return
-    pids = []
-    if shutil.which("ss"):
-        out = subprocess.run(["ss", "-lptnH", f"sport = :{port}"],
-                             capture_output=True, text=True).stdout
-        pids = sorted(set(re.findall(r"pid=(\d+)", out)))
-    print(f"  ⚠ 포트 {port} 를 이미 쓰고 있습니다"
-          f"{' (pid ' + ', '.join(pids) + ')' if pids else ''}.")
-    if not pids:
-        die("     다른 포트를 쓰십시오: --port <번호>")
-    if not force and not (dm.prompt("     종료하고 진행할까요? (y/N): ") or "N").lower().startswith("y"):
-        die("     중단했습니다. 다른 포트: --port <번호>")
-    for pid in pids:
-        try:
-            os.kill(int(pid), signal.SIGTERM)
-        except OSError:
-            pass
-    for _ in range(20):
-        if not port_in_use(host, port):
-            print("     종료했습니다.")
-            wait_vram_release()
-            return
-        time.sleep(0.5)
-    die("     종료되지 않았습니다. 수동으로 정리하십시오.")
 
 
 def wait_vram_release(timeout=30):
@@ -744,6 +908,9 @@ def build_cmd(vllm_bin, model, args, util, parser, reasoning=None):
         cmd += ["--max-num-seqs", str(args.max_num_seqs)]
     if args.eager:
         cmd += ["--enforce-eager"]
+    # --extra 로 직접 지정했으면 그쪽을 존중한다 (중복 지정은 vLLM 이 거부한다)
+    if not any(a.startswith("--kv-cache-dtype") for a in args.extra):
+        cmd += ["--kv-cache-dtype", args.kv_cache_dtype]
     if parser:
         cmd += ["--enable-auto-tool-choice", "--tool-call-parser", parser]
     if reasoning:
@@ -971,15 +1138,21 @@ def main(argv):
     print(" vLLM 서버 기동")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
+    global _INTERACTIVE
+    _INTERACTIVE = not args.yes
+    if args.dry_run and args.port is None:
+        args.port = 8000
+
     vllm_bin = find_vllm()
 
-    # ★ 포트 정리를 GPU 측정보다 **먼저** 한다.
+    # ★ 기존 vLLM 처리와 포트 선택을 GPU 측정보다 **먼저** 한다.
     # 옛 서버가 VRAM 을 쥔 채로 재면 util 이 터무니없이 낮게 잡히고,
     # 그 뒤에 죽여봐야 util 은 이미 고정된 뒤라 기동이 실패한다 (실측 사고).
     if not args.dry_run:
+        handle_existing(True if args.force else args.kill_existing)
         section("포트")
-        free_port(args.host, args.port, args.force)
-        print(f"  {args.host}:{args.port} 사용 가능")
+        args.port = pick_port(args.port, args.host)
+        print(f"  → {args.host}:{args.port}")
 
     gpu = gpu_info()
     section("GPU")
@@ -995,6 +1168,15 @@ def main(argv):
     parser = decide_tool_parser(model, config, args.tool_parser, args.no_tools)
     reasoning = decide_reasoning_parser(model, config, args.reasoning_parser,
                                         args.no_reasoning)
+
+    section("KV 캐시")
+    if any(a.startswith("--kv-cache-dtype") for a in args.extra):
+        print("  → --extra 지정을 따름")
+    elif args.kv_cache_dtype == "auto":
+        print("  → auto (fp16 원본) — 같은 util 에서 담기는 토큰이 절반이 된다")
+    else:
+        print(f"  → {args.kv_cache_dtype} (기본) — 토큰 밀도 1.97배, "
+              "품질 손실 측정 한계 이하")
 
     cmd = build_cmd(vllm_bin, model, args, util, parser, reasoning)
     section("실행")
