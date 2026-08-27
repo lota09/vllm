@@ -64,10 +64,14 @@ vLLM 을 설치하고 스모크 테스트까지 돌린다. GPU·드라이버·�
 
 ## 문서
 
-- **[`docs/quantization_concepts.md`](docs/quantization_concepts.md)** — 양자화 세 축(W/A/KV),
-  체크포인트 해부, 폴백이 일어나는 이유, GGUF 진영과의 대조, 전 형식 실측
+- **[`docs/quantization.md`](docs/quantization.md)** — 세 축(W/A/KV) · 형식별 호환성 ·
+  폴백이 일어나는 이유 · 정확도 손실 실측 · 저장소 고르는 법
+- **[`docs/hardware.md`](docs/hardware.md)** — 이 카드의 연산 유닛 · 클럭 도메인 ·
+  전력·발열 · 전력캡이 성능에 미치는 영향
+- **[`docs/performance.md`](docs/performance.md)** — 프리필/디코드 역학 ·
+  **CUDA 그래프 vs eager** · 연속 배칭 · KV 축 · llama.cpp 대조
 - **[`docs/vllm_learning_plan.md`](docs/vllm_learning_plan.md)** — llama.cpp ↔ vLLM 번역 사전과
-  단계별 실측 커리큘럼
+  단계별 커리큘럼
 - `models/model_bookmark.md` — 후보 모델을 `W축-A축` 으로 분류한 목록 (로컬 전용, 아래 참조)
 
 ## 주요 실측 결과
