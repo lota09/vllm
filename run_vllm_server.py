@@ -128,12 +128,13 @@ def parse_args(argv):
     p.add_argument("--len", dest="max_model_len", type=int, default=None,
                    help="--max-model-len. 생략하면 모델 기본값")
     p.add_argument("--max-num-seqs", type=int, default=None)
-    p.add_argument("--kv", dest="kv_cache_dtype", default="fp8",
-                   choices=["fp8", "fp8_e4m3", "fp8_e5m2", "auto"],
-                   help="KV 캐시 양자화. 기본 fp8 — 토큰 밀도 1.97배를 품질 손실 "
-                        "없이 얻는다(실측: 64k 문맥까지 PPL 0.987~0.999x, "
-                        "정답과제 동일). auto 는 fp16 원본. "
-                        "docs/quantization_concepts.md §7.95.3")
+    p.add_argument("--kv", dest="kv_cache_dtype", default="auto",
+                   choices=["auto", "fp8", "fp8_e4m3", "fp8_e5m2"],
+                   help="KV 캐시 양자화. 기본 auto(모델 dtype 그대로) — 안전한 쪽이 "
+                        "기본이다. fp8 은 토큰 밀도 1.97배를 얻지만 조건이 붙는다: "
+                        "슬라이딩 윈도우 층이 많으면 vLLM 이 권하지 않고, SM80 의 "
+                        "Triton 백엔드(Gemma4 등 head_dim 512)는 아예 거부한다. "
+                        "docs/quantization.md §5 · docs/performance.md §5")
     p.add_argument("--eager", dest="eager", action="store_true", default=True,
                    help="--enforce-eager (기본 켜짐). CUDA 그래프 캡처를 건너뛰어 기동이 빠르다")
     p.add_argument("--no-eager", dest="eager", action="store_false",
@@ -894,6 +895,32 @@ def format_cmd(cmd):
     return " \\\n".join(out)
 
 
+def _fp8_kv_worth_it(config):
+    """fp8 KV 가 이 모델에서 이득일 만한가.
+
+    ★ 슬라이딩 윈도우 층이 많으면 아니다. 그 층들의 KV 는 창 크기에서 잘리므로
+      길이에 비례해 자라지 않는다 — 절반으로 줄일 대상 자체가 작다.
+      vLLM 공식 평가도 "슬라이딩 윈도우 레이어가 많을 때" 를 fp8 KV 비권장
+      조건으로 명시한다 (2026-04-22 블로그).
+      게다가 SM80 에서 head_dim > 256 인 모델(Gemma4 의 full_attention 512)은
+      FlashAttention 이 못 받아 Triton 으로 폴백하고, Triton 은 fp8 KV 에
+      SM89+ 를 요구해 **기동 자체가 실패한다** (실측).
+    """
+    if not isinstance(config, dict):
+        return True
+    t = config.get("text_config") or config
+    lt = t.get("layer_types") or []
+    if lt:
+        sw = sum(1 for x in lt if "sliding" in str(x).lower())
+        if sw > len(lt) / 2:
+            return False
+    for k in ("head_dim", "global_head_dim"):
+        v = t.get(k)
+        if isinstance(v, int) and v > 256:
+            return False
+    return True
+
+
 def build_cmd(vllm_bin, model, args, util, parser, reasoning=None):
     # --served-model-name 을 반드시 준다. 안 주면 vLLM 이 **전체 경로**를 모델 id 로
     # 쓰기 때문에 API 호출 때마다 절대경로를 적어야 한다 (실측으로 확인했다).
@@ -1173,10 +1200,19 @@ def main(argv):
     if any(a.startswith("--kv-cache-dtype") for a in args.extra):
         print("  → --extra 지정을 따름")
     elif args.kv_cache_dtype == "auto":
-        print("  → auto (fp16 원본) — 같은 util 에서 담기는 토큰이 절반이 된다")
+        print("  → auto (기본) — 모델 dtype 그대로. 손실 없음")
+        # fp8 이 실제로 이득인 조건일 때만 권한다. 슬라이딩 윈도우가 많은 모델
+        # (Gemma4 등)은 어차피 잘리는 KV 라 얻는 게 적고, SM80 Triton 백엔드는
+        # fp8 KV 를 거부한다 — vLLM 자신이 그런 모델에는 권하지 않는다.
+        if _fp8_kv_worth_it(config):
+            print("     `--kv fp8` 이면 같은 util 에 토큰이 1.97배 들어갑니다")
+            print("     (실측: 64k 문맥까지 PPL 0.987~0.999x · 정답과제 동일)")
     else:
-        print(f"  → {args.kv_cache_dtype} (기본) — 토큰 밀도 1.97배, "
-              "품질 손실 측정 한계 이하")
+        print(f"  → {args.kv_cache_dtype} — 토큰 밀도 1.97배")
+        if not _fp8_kv_worth_it(config):
+            print("     ⚠ 이 모델은 슬라이딩 윈도우 층이 많습니다. vLLM 은 이런 모델에")
+            print("        fp8 KV 를 권하지 않고, SM80 Triton 백엔드는 거부할 수 있습니다.")
+            print("        막히면 `--kv auto` 로 다시 실행하십시오.")
 
     cmd = build_cmd(vllm_bin, model, args, util, parser, reasoning)
     section("실행")

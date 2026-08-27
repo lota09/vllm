@@ -26,8 +26,9 @@ set -euo pipefail
 #   - 실패해도 어디서 왜 실패했는지 요약에 남긴다 (첫 실패에서 죽지 않는다)
 #
 # 사용:
-#   ./setup_vllm.sh
-#   VLLM_VERSION=0.11.0 ./setup_vllm.sh      # 버전 핀
+#   ./setup_vllm.sh                          # ★ 항상 최신 vLLM 으로 맞춘다
+#   ./setup_vllm.sh --vllm-version=0.28.0    # 버전을 못박는다 (그 버전이면 건너뜀)
+#   ./setup_vllm.sh --vllm-version 0.28.0    # 같은 뜻
 #   FORCE_RECREATE=1 ./setup_vllm.sh         # venv 재생성
 #   SKIP_SMOKE=1 ./setup_vllm.sh             # 설치만
 
@@ -38,7 +39,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 VENV_DIR=${VENV_DIR:-$SCRIPT_DIR/.venv}
 PY_VERSION=${PY_VERSION:-3.12}
-VLLM_VERSION=${VLLM_VERSION:-}          # 비우면 최신
+VLLM_VERSION=${VLLM_VERSION:-}          # 비우면 **항상 최신으로 올린다**
 TORCH_BACKEND=${TORCH_BACKEND:-auto}    # auto | cu126 | cu128 ...
 FORCE_RECREATE=${FORCE_RECREATE:-0}
 SKIP_SMOKE=${SKIP_SMOKE:-0}
@@ -46,6 +47,24 @@ SKIP_OOM_PROBE=${SKIP_OOM_PROBE:-0}
 NONINTERACTIVE=${NONINTERACTIVE:-0}
 MIN_FREE_GB=${MIN_FREE_GB:-15}          # venv 가 torch+CUDA 런타임으로 10GB+ 를 먹는다
 UV_INSTALLER_URL=${UV_INSTALLER_URL:-https://astral.sh/uv/install.sh}
+
+# ─────────────────────────────────────────────
+# 인자
+#
+# ★ 기본 동작은 "항상 최신 vLLM 으로 맞춘다" 이다.
+#   버전을 못박고 싶을 때만 --vllm-version 을 준다.
+# ─────────────────────────────────────────────
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --vllm-version=*) VLLM_VERSION="${1#*=}"; shift ;;
+    --vllm-version)   VLLM_VERSION="${2:-}"; [ -z "$VLLM_VERSION" ] && {
+                        echo "--vllm-version 에 버전이 필요합니다" >&2; exit 2; }; shift 2 ;;
+    -h|--help)
+      sed -n '/^# 사용:/,/^$/p' "$0" | sed 's/^# \?//'
+      exit 0 ;;
+    *) echo "알 수 없는 인자: $1  (--help 참조)" >&2; exit 2 ;;
+  esac
+done
 
 # 최종 요약에 모을 결과
 declare -a WARNINGS=()
@@ -298,10 +317,36 @@ CUR_VLLM="$(_installed_vllm_ver || true)"
 SPEC="vllm"
 [ -n "$VLLM_VERSION" ] && SPEC="vllm==$VLLM_VERSION"
 
-if [ -n "$CUR_VLLM" ] && { [ -z "$VLLM_VERSION" ] || [ "$CUR_VLLM" = "$VLLM_VERSION" ]; } ; then
-  echo "  이미 설치됨: vllm $CUR_VLLM → 설치 단계 건너뜀"
-  echo "  (최신으로 올리려면: VLLM_VERSION=<버전> 또는 uv pip install -p $VENV_PY -U vllm)"
+# ★ 업그레이드는 핀을 깨뜨릴 수 있다. 이 박스에서 실제로 겪은 것들:
+#     nvcc 13.3 vs 헤더 13.2 불일치  → FlashInfer JIT 컴파일 실패
+#     ptxas '.version 9.3' 미지원     → nvidia-cuda-crt·nvvm 까지 같이 내려야 했다
+#   그래서 올리기 **전에** 핵심 핀을 적어두고 **후에** 대조한다.
+_pin_snapshot() {
+  uv pip freeze --python "$VENV_PY" 2>/dev/null \
+    | grep -iE '^(torch|torchvision|torchaudio|transformers|nvidia-|flashinfer|compressed-tensors|triton)' \
+    | sort
+}
+
+if [ -n "$CUR_VLLM" ] && [ -n "$VLLM_VERSION" ] && [ "$CUR_VLLM" = "$VLLM_VERSION" ]; then
+  # 버전을 못박았고 이미 그 버전이다 → 할 일 없음
+  echo "  이미 $VLLM_VERSION 입니다 → 설치 단계 건너뜀"
 else
+  if [ -z "$VLLM_VERSION" ]; then
+    LATEST="$("$VENV_PY" -c "import json,urllib.request;print(json.load(urllib.request.urlopen('https://pypi.org/pypi/vllm/json',timeout=8))['info']['version'])" 2>/dev/null || true)"
+    if [ -n "$CUR_VLLM" ] && [ -n "$LATEST" ] && [ "$CUR_VLLM" = "$LATEST" ]; then
+      echo "  이미 최신입니다: vllm $CUR_VLLM → 설치 단계 건너뜀"
+      SKIP_INSTALL=1
+    else
+      echo "  버전 미지정 → 최신으로 맞춥니다${CUR_VLLM:+ (현재 $CUR_VLLM${LATEST:+ → $LATEST})}"
+    fi
+  fi
+  if [ "${SKIP_INSTALL:-0}" = "1" ]; then
+    :
+  else
+    if [ -n "$CUR_VLLM" ]; then
+      echo "  변경: vllm $CUR_VLLM → ${VLLM_VERSION:-최신}"
+      PINS_BEFORE="$(_pin_snapshot)"
+    fi
   INSTALL_ARGS=(pip install --python "$VENV_PY" "$SPEC")
   if [ "$UV_HAS_TORCH_BACKEND" = "1" ]; then
     INSTALL_ARGS+=("--torch-backend=$TORCH_BACKEND")
@@ -309,9 +354,27 @@ else
   fi
   echo "  실행: uv ${INSTALL_ARGS[*]}"
   echo "  (수 GB 다운로드 — 최초 1회는 시간이 걸립니다. 재시도는 uv 캐시 덕에 빠릅니다)"
+  [ -z "$VLLM_VERSION" ] && INSTALL_ARGS+=("-U")
   uv "${INSTALL_ARGS[@]}"
   CUR_VLLM="$(_installed_vllm_ver || echo '불명')"
   echo "  설치 완료: vllm $CUR_VLLM"
+  fi
+
+  # ── 핀 대조 ──
+  if [ -n "${PINS_BEFORE:-}" ]; then
+    PINS_AFTER="$(_pin_snapshot)"
+    if [ "$PINS_BEFORE" = "$PINS_AFTER" ]; then
+      echo "  ✓ torch·transformers·CUDA 핀 변동 없음"
+    else
+      echo ""
+      echo "  ⚠ 핀이 바뀌었습니다 — 아래를 확인하십시오:"
+      diff <(echo "$PINS_BEFORE") <(echo "$PINS_AFTER") | grep -E '^[<>]' | sed 's/^/     /' || true
+      echo ""
+      echo "     nvidia-cuda-nvcc / nvidia-cuda-crt / nvidia-nvvm 이 서로 다른 버전이면"
+      echo "     FlashInfer JIT 이 'ptxas: Unsupported .version' 으로 실패합니다."
+      SMOKE_FAILS=$((SMOKE_FAILS+1))
+    fi
+  fi
 fi
 
 # ─────────────────────────────────────────────

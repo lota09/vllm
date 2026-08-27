@@ -223,7 +223,7 @@ vllm serve <repo> --port 8000 \
 > 요약: `--enforce-eager` 를 끄면 디코드 **3.80배**(14.4 → 54.7 tok/s), 대가는 기동
 > 88 → 271 초(캐시 히트 106 초)와 KV 풀 1~2 GiB. fp8 KV 는 VRAM 을 절반으로 줄이면서
 > 성능 유지율 98~99%.
-> 상세: [`performance.md`](performance.md) §3 (CUDA 그래프) · §4.1 (설정별 종단간) · §5 (KV 축)
+> 상세: [`performance.md`](performance.md) — §3 CUDA 그래프 / §4.1 설정별 종단간 / §5 KV 축
 
 #### ★ 손잡이는 독립이 아니다 — `util` ↓ 이면 `--max-num-seqs` 도 ↓
 
