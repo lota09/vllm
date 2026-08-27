@@ -352,7 +352,7 @@ def inspect_model(path, gpu):
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. util / 컨텍스트
 # ─────────────────────────────────────────────────────────────────────────────
-def decide_util(gpu, weight_b, want):
+def decide_util(gpu, weight_b, want, config=None):
     """--gpu-memory-utilization 을 정한다.
 
     함정: util 은 '남은 VRAM' 이 아니라 **GPU 전체** 대비 비율이다. llama-server 가
@@ -380,11 +380,11 @@ def decide_util(gpu, weight_b, want):
         if want > ceiling:
             print(f"  ⚠ 지정한 util {want:.2f} 가 상한 {ceiling:.2f} 를 넘습니다 — OOM 가능")
         print(f"  → 사용       : {want:.2f} (지정)")
-        _check_budget(want, label_mib, weight_b)
+        _check_budget(want, label_mib, weight_b, config)
         return want
     chosen = ask_util(auto, ceiling, label_mib, weight_b)
     print(f"  → 사용       : {chosen:.2f}")
-    _check_budget(chosen, label_mib, weight_b)
+    _check_budget(chosen, label_mib, weight_b, config)
     return chosen
 
 
@@ -440,7 +440,72 @@ def ask_util(auto, ceiling, label_mib, weight_b):
         return v
 
 
-def _check_budget(util, label_mib, weight_b):
+def _runtime_overhead_mib(config):
+    """가중치 외에 vLLM 이 먹는 몫의 보수적 추정 (MiB).
+
+    실측(orcarouter Qwen3.8-27B, util 0.50): 예산 32,768 − 가중치 23,060 = 9,708 인데
+    실제 `Available KV cache memory` 는 6.99 GiB(7,157) 였다. **2 GiB 가 비었다.**
+    단순히 '예산 − 가중치' 로 KV 를 추정하면 그만큼 낙관적이 된다.
+
+    빠지는 몫: PyTorch 활성화 피크 · non-torch(커널·컨텍스트) · 멀티모달 인코더 캐시.
+    인코더 캐시는 VLM 에서만 잡히고 기본 예산이 16,384 토큰이라 무시 못 한다.
+    """
+    over = 1200                       # 활성화 피크 + non-torch, 보수적으로
+    if isinstance(config, dict):
+        if config.get("vision_config") or config.get("audio_config"):
+            over += 900               # 멀티모달 인코더 캐시
+    return over
+
+
+def _kv_bytes_per_token(config):
+    """토큰당 KV 바이트. 알 수 없으면 None.
+
+    하이브리드(Qwen3.5/3.8 의 linear_attention, Mamba 등)는 **full_attention 층만**
+    길이에 비례해 자란다. layer_types 가 있으면 그것만 센다.
+    """
+    if not isinstance(config, dict):
+        return None
+    t = config.get("text_config") or config
+    kv_heads = t.get("num_key_value_heads")
+    head_dim = t.get("head_dim")
+    layers = t.get("num_hidden_layers")
+    if not (kv_heads and head_dim and layers):
+        return None
+    lt = t.get("layer_types") or []
+    if lt:
+        layers = sum(1 for x in lt if "full" in str(x).lower()) or layers
+    dt = str(t.get("dtype") or t.get("torch_dtype") or "bfloat16")
+    elem = 4 if "32" in dt else 2
+    # ⚠ 이것은 **상한**이다. 하이브리드 모델(Qwen3.5/3.8)에서 실측과 2배 어긋났다:
+    #   이 식은 64 KiB/토큰, vLLM 실제는 33.3 KiB/토큰.
+    #   K/V 의 실제 head_dim 이 Q 와 다를 수 있고, 페이지 정렬도 개입한다.
+    #   과대 추정은 "안 되는데 된다고 하는" 것보다 안전하므로 그대로 쓰되,
+    #   사용자에게는 상한임을 밝히고 정확한 값은 vLLM 이 알려준다고 안내한다.
+    return layers * 2 * kv_heads * head_dim * elem
+
+
+def _max_len_fits(util, label_mib, weight_b, config):
+    """이 util 로 **최대 길이 요청 하나**가 들어가는가.
+
+    (들어가나, 필요 MiB, 가용 MiB, 최대 길이) — 판단 불가면 None.
+
+    ★ 이걸 미리 안 보면 vLLM 이 가중치를 다 올리고 나서
+      "To serve at least one request with the model's max seq len ... is needed,
+       which is larger than the available KV cache memory" 로 죽는다. 2분 낭비다.
+    """
+    per_tok = _kv_bytes_per_token(config)
+    if not per_tok or not weight_b:
+        return None
+    t = (config.get("text_config") or config) if isinstance(config, dict) else {}
+    max_len = t.get("max_position_embeddings")
+    if not max_len:
+        return None
+    avail = util * label_mib - weight_b / (1024 * 1024) - _runtime_overhead_mib(config)
+    need = per_tok * max_len / (1024 * 1024)
+    return (need <= avail, need, avail, max_len)
+
+
+def _check_budget(util, label_mib, weight_b, config=None):
     """util 이 정해진 뒤, 그 예산 안에 가중치가 들어가는지 본다.
 
     vLLM 은 가중치를 다 올리고 나서야 'Available KV cache memory: -13.6 GiB' 로 죽는다.
@@ -450,9 +515,10 @@ def _check_budget(util, label_mib, weight_b):
         return
     budget_mib = util * label_mib
     weight_mib = weight_b / (1024 * 1024)
-    head_mib = budget_mib - weight_mib
+    over_mib = _runtime_overhead_mib(config)
+    head_mib = budget_mib - weight_mib - over_mib
     print(f"  KV 여유 추정 : 약 {head_mib:.0f} MiB "
-          f"(예산 {budget_mib:.0f} − 가중치 {weight_mib:.0f})")
+          f"(예산 {budget_mib:.0f} − 가중치 {weight_mib:.0f} − 런타임 {over_mib:.0f})")
     if head_mib < 0:
         sys.stdout.flush()
         print(f"  ⛔ 예산({budget_mib:.0f} MiB)이 가중치({weight_mib:.0f} MiB)보다 작습니다. "
@@ -465,6 +531,22 @@ def _check_budget(util, label_mib, weight_b):
             sys.exit(1)
     elif head_mib < 2048:
         print("  ⚠ KV 여유가 2 GiB 미만입니다. 컨텍스트를 짧게 잡으십시오.")
+
+    # ★ 최대 길이 요청 하나가 들어가는지 — 안 들어가면 vLLM 이 기동을 거부한다
+    fit = _max_len_fits(util, label_mib, weight_b, config)
+    if fit and not fit[0]:
+        ok, need, avail, max_len = fit
+        safe = int(avail / (need / max_len) * 0.92 / 1024) * 1024
+        print("")
+        print("  ⚠ 이 util 로는 **최대 길이 요청 하나**가 안 들어갈 수 있습니다.")
+        print(f"     모델 최대 {max_len:,} 토큰 → KV 최대 {need:.0f} MiB 필요 / 가용 약 {avail:.0f} MiB")
+        print("     그러면 vLLM 이 가중치를 다 올린 뒤 기동을 거부합니다 (약 2분 낭비).")
+        print("     ※ 필요량은 **상한 추정**입니다 — 하이브리드 모델은 실제로 절반 수준일 수 있고,")
+        print("        vLLM 이 거부할 때 'estimated maximum model length' 로 정확한 값을 알려줍니다.")
+        print("     대응:")
+        print(f"       --len {safe}   ← 이 값이면 확실히 들어갑니다 (동시 처리도 늘어남)")
+        print(f"       --util {min(0.95, (weight_mib + over_mib + need) / label_mib + 0.03):.2f}"
+              "   ← 컨텍스트를 그대로 두고 예산을 늘림")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1191,7 +1273,7 @@ def main(argv):
 
     model = args.model or choose_model()
     config, weight_b, quant = inspect_model(model, gpu)
-    util = decide_util(gpu, weight_b, args.util)
+    util = decide_util(gpu, weight_b, args.util, config)
     parser = decide_tool_parser(model, config, args.tool_parser, args.no_tools)
     reasoning = decide_reasoning_parser(model, config, args.reasoning_parser,
                                         args.no_reasoning)
