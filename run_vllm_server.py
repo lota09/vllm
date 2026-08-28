@@ -135,10 +135,16 @@ def parse_args(argv):
                         "슬라이딩 윈도우 층이 많으면 vLLM 이 권하지 않고, SM80 의 "
                         "Triton 백엔드(Gemma4 등 head_dim 512)는 아예 거부한다. "
                         "docs/quantization.md §5 · docs/performance.md §5")
-    p.add_argument("--eager", dest="eager", action="store_true", default=True,
-                   help="--enforce-eager (기본 켜짐). CUDA 그래프 캡처를 건너뛰어 기동이 빠르다")
+    # ★ 기본은 CUDA 그래프 ON (--enforce-eager 를 주지 않는다).
+    #   디코드가 3.8배 빨라진다(14.4 → 54.7 tok/s). 대가는 기동 88 → 271초인데
+    #   컴파일 캐시가 먹으면 106초로 줄고, 상주 서버라면 1회성이다.
+    #   손잡이를 자주 돌리는 디버깅 때만 --eager 를 준다.
+    #   상세: docs/performance.md §3
+    p.add_argument("--eager", dest="eager", action="store_true", default=False,
+                   help="--enforce-eager 를 켠다. 기동이 빠른 대신 디코드가 3.8배 느리다 "
+                        "— 디버깅·짧은 실험 전용")
     p.add_argument("--no-eager", dest="eager", action="store_false",
-                   help="CUDA 그래프를 캡처한다. 기동은 느려지고 추론은 빨라진다")
+                   help="(기본값) CUDA 그래프를 캡처한다. 기동은 느리고 추론은 빠르다")
     p.add_argument("--tool-parser", default=None,
                    help="툴 콜 파서를 직접 지정 (자동 추정을 무시)")
     p.add_argument("--no-tools", action="store_true",
@@ -149,8 +155,9 @@ def parse_args(argv):
                    help="reasoning 파서를 붙이지 않는다")
     p.add_argument("--name", default=None,
                    help="--served-model-name. 생략하면 디렉터리 이름을 쓴다")
-    p.add_argument("--timeout", type=int, default=180,
-                   help="준비 대기 상한(초, 기본 180). 넘겨도 서버는 계속 로딩한다")
+    p.add_argument("--timeout", type=int, default=420,
+                   help="준비 대기 상한(초). 기본 420 — CUDA 그래프가 기본이라 콜드 "
+                        "기동이 271초까지 간다(캐시 히트면 106초). --eager 면 90초면 충분하다")
     p.add_argument("--dry-run", action="store_true",
                    help="실행할 명령만 출력하고 끝낸다")
     p.add_argument("--kill-existing", dest="kill_existing", action="store_true", default=None,

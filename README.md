@@ -45,9 +45,16 @@ vLLM 을 설치하고 스모크 테스트까지 돌린다. GPU·드라이버·�
 모델을 고르고 util 을 계산해 vLLM 을 띄운다. 대화형이 기본이고 옵션으로 전부 건너뛴다.
 
 ```bash
-./run_vllm_server.py                                   # 전부 물어봄
-./run_vllm_server.py models/<name> --no-eager --util 0.90 -y   # 벤치용
+./run_vllm_server.py                              # 전부 물어봄
+./run_vllm_server.py models/<name> --util 0.90 -y # 비대화형
 ```
+
+**기본값 두 개가 실측에서 정해졌다:**
+
+| 손잡이 | 기본 | 왜 |
+|:---|:---|:---|
+| CUDA 그래프 | **켜짐** (`--eager` 로 끔) | 디코드 **3.8배**. 대가는 기동 88→271초인데 캐시 히트면 106초 |
+| `--kv` | **auto** | 안전한 쪽. fp8 은 이득이 큰 모델에만 권한다 |
 
 기존 서버 종료 여부·포트·util·KV dtype 을 묻고, 기동 로그를 감시해 치명적 오류를 판별한다.
 `--kv` 기본값은 **auto**(모델 dtype 그대로) — 안전한 쪽이 기본이다.

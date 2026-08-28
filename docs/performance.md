@@ -328,6 +328,9 @@ Graph capturing finished in  9 secs, took 1.53 GiB
 | 디버깅 | **실패한 연산이 스택에 찍힘** | 오류가 불투명해짐 |
 
 > **상주 추론은 그래프, 디버깅은 eager.**
+> `run_vllm_server.py` 의 기본은 **그래프 ON** 이다 (`--eager` 로만 끈다).
+> `--timeout` 기본도 420초로 잡았다 — 콜드 캡처가 271초까지 가므로 180초로는
+> 정상 기동을 '실패' 로 오인한다 (실측 재확인: 241.1초).
 > 그리고 **속도가 이상하면 `--enforce-eager` 가 켜져 있는지부터 보라.**
 > 하드웨어를 의심하는 것보다 빠르다 — `/proc/<pid>/cmdline` 한 번이면 된다
 > (실제로 이 실수를 했다: [`hardware.md`](hardware.md) §3.2).
